@@ -1,6 +1,6 @@
 # Binaries
 /bin/
-antrequeue
+/antrequeue
 *.exe
 *.dll
 *.so
