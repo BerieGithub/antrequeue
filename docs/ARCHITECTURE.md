@@ -60,11 +60,25 @@ mobile burst ──► KAFKA (durable ingest, partitioned by entity)
 
 Each broker has exactly one job.
 
-### Simpler alternative
+### When Redis Streams is enough
 
-If two brokers is too much operationally, **Redis Streams** offers consumer
-groups, per-message acks and enough durability for most of this, using
-infrastructure already present. The Kafka + RabbitMQ split can come later.
+Redis Streams offers consumer groups, per-message acks and enough durability
+for a single-service workload, on infrastructure most stacks already run. It
+is the right starting point, and antrequeue should not be sold as an upgrade
+from it by default.
+
+The two-broker split earns its operational cost at three boundaries:
+
+- **Retry scheduling.** Streams have no delay primitive. Once retries need
+  tiers (30s / 5m / 1h), you are hand-rolling a scheduler that RabbitMQ ships
+  as a dead-letter TTL exchange.
+- **Burst ingest.** Redis holds the stream in memory. A fleet of mobile
+  clients reconnecting after days offline can outrun what you are willing to
+  give it.
+- **Replayable audit.** Streams trim. Once "what happened to every job last
+  quarter" has to be answerable, you need a log that does not.
+
+Below those boundaries, Redis Streams. Above them, this design.
 
 ## ADR 002 - Jobs are durable, delivery of results is not
 

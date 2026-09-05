@@ -67,7 +67,7 @@ curl -X POST http://localhost:8090/v1/jobs \
         "payload": {"company_id": 789, "year": 2026},
         "priority": "high",
         "max_attempts": 5,
-        "callback_url": "https://ssap.example.com/webhooks/antrequeue",
+        "callback_url": "https://your-app.example.com/webhooks/antrequeue",
         "idempotency_key": "carbon-report-789-2026"
       }'
 ```
