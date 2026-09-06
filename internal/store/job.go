@@ -17,7 +17,7 @@ const (
 	StatusRunning   Status = "running"
 	StatusRetrying  Status = "retrying"
 	StatusSucceeded Status = "succeeded"
-	StatusFailed    Status = "failed"     // exhausted retries -> dead letter
+	StatusFailed    Status = "failed" // exhausted retries -> dead letter
 	StatusCancelled Status = "cancelled"
 )
 
@@ -62,9 +62,9 @@ type Store interface {
 }
 
 type Memory struct {
-	mu     sync.RWMutex
-	jobs   map[string]*Job
-	byKey  map[string]string
+	mu    sync.RWMutex
+	jobs  map[string]*Job
+	byKey map[string]string
 }
 
 func NewMemory() *Memory {
