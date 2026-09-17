@@ -1,4 +1,4 @@
-.PHONY: run build test tidy fmt vet docker-up docker-down
+.PHONY: run build test test-race tidy fmt vet docker-up docker-down
 
 run:
 	go run ./cmd/api
@@ -6,7 +6,13 @@ run:
 build:
 	go build -o bin/antrequeue-api ./cmd/api
 
+# Portable: runs anywhere Go does.
 test:
+	go test ./... -cover
+
+# What CI gates on. Needs cgo and a C toolchain (gcc or clang), so it will not
+# run on a bare Windows checkout; use `make test` there and let CI catch races.
+test-race:
 	go test ./... -race -cover
 
 tidy:
