@@ -4,6 +4,7 @@ package store
 
 import (
 	"errors"
+	"maps"
 	"sync"
 	"time"
 
@@ -30,6 +31,15 @@ const (
 	PriorityCritical Priority = "critical"
 )
 
+// Valid reports whether p is one of the four documented priorities.
+func (p Priority) Valid() bool {
+	switch p {
+	case PriorityLow, PriorityNormal, PriorityHigh, PriorityCritical:
+		return true
+	}
+	return false
+}
+
 type Job struct {
 	ID          string         `json:"id"`
 	Type        string         `json:"type"`
@@ -52,12 +62,42 @@ type Job struct {
 	LastError   string     `json:"last_error,omitempty"`
 }
 
-var ErrNotFound = errors.New("antrequeue: job not found")
+// Clone returns a copy safe to hand to another goroutine.
+//
+// Payload is copied one level deep. Values inside it come from the submitted
+// JSON body and are never mutated after Create, so sharing them is safe; the
+// map itself is copied because callers may add keys to their own copy.
+func (j *Job) Clone() *Job {
+	if j == nil {
+		return nil
+	}
+	c := *j
+	if j.Payload != nil {
+		c.Payload = maps.Clone(j.Payload)
+	}
+	if j.ScheduledAt != nil {
+		t := *j.ScheduledAt
+		c.ScheduledAt = &t
+	}
+	return &c
+}
+
+var (
+	ErrNotFound = errors.New("antrequeue: job not found")
+	ErrNilJob   = errors.New("antrequeue: nil job")
+)
 
 type Store interface {
-	Create(j *Job) error
+	// Create inserts j and returns the stored record.
+	//
+	// If j.IdempotencyKey is already present, the existing job is returned
+	// with created=false and nothing is inserted. The lookup and the insert
+	// are one atomic step, so concurrent submissions carrying the same key
+	// resolve to a single job. A Postgres implementation gets this from
+	// INSERT ... ON CONFLICT (idempotency_key) DO NOTHING.
+	Create(j *Job) (stored *Job, created bool, err error)
+
 	Get(id string) (*Job, error)
-	ByIdempotencyKey(key string) (*Job, bool)
 	Update(j *Job) error
 }
 
@@ -71,19 +111,34 @@ func NewMemory() *Memory {
 	return &Memory{jobs: make(map[string]*Job), byKey: make(map[string]string)}
 }
 
-func (m *Memory) Create(j *Job) error {
+func (m *Memory) Create(j *Job) (*Job, bool, error) {
+	if j == nil {
+		return nil, false, ErrNilJob
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if j.ID == "" {
-		j.ID = uuid.NewString()
+
+	if j.IdempotencyKey != "" {
+		if id, ok := m.byKey[j.IdempotencyKey]; ok {
+			if existing, ok := m.jobs[id]; ok {
+				return existing.Clone(), false, nil
+			}
+		}
+	}
+
+	stored := j.Clone()
+	if stored.ID == "" {
+		stored.ID = uuid.NewString()
 	}
 	now := time.Now().UTC()
-	j.CreatedAt, j.UpdatedAt = now, now
-	m.jobs[j.ID] = j
-	if j.IdempotencyKey != "" {
-		m.byKey[j.IdempotencyKey] = j.ID
+	stored.CreatedAt, stored.UpdatedAt = now, now
+
+	m.jobs[stored.ID] = stored
+	if stored.IdempotencyKey != "" {
+		m.byKey[stored.IdempotencyKey] = stored.ID
 	}
-	return nil
+	return stored.Clone(), true, nil
 }
 
 func (m *Memory) Get(id string) (*Job, error) {
@@ -93,27 +148,25 @@ func (m *Memory) Get(id string) (*Job, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	return j, nil
-}
-
-func (m *Memory) ByIdempotencyKey(key string) (*Job, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	id, ok := m.byKey[key]
-	if !ok {
-		return nil, false
-	}
-	j, ok := m.jobs[id]
-	return j, ok
+	return j.Clone(), nil
 }
 
 func (m *Memory) Update(j *Job) error {
+	if j == nil {
+		return ErrNilJob
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.jobs[j.ID]; !ok {
 		return ErrNotFound
 	}
-	j.UpdatedAt = time.Now().UTC()
-	m.jobs[j.ID] = j
+
+	stored := j.Clone()
+	stored.UpdatedAt = time.Now().UTC()
+	m.jobs[stored.ID] = stored
+	if stored.IdempotencyKey != "" {
+		m.byKey[stored.IdempotencyKey] = stored.ID
+	}
 	return nil
 }

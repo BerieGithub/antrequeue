@@ -10,10 +10,17 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/BerieGithub/antrequeue/internal/store"
+)
+
+const (
+	maxBodyBytes       = 1 << 20 // 1 MiB
+	defaultMaxAttempts = 5
+	maxAttemptsLimit   = 100
 )
 
 type API struct {
@@ -45,7 +52,38 @@ type submitRequest struct {
 	MaxAttempts    int            `json:"max_attempts"`
 	CallbackURL    string         `json:"callback_url"`
 	IdempotencyKey string         `json:"idempotency_key"`
-	ScheduleAt     *time.Time     `json:"schedule_at"`
+	ScheduledAt    *time.Time     `json:"scheduled_at"`
+}
+
+// validate applies defaults in place and returns a client-facing message when
+// the request cannot be accepted.
+func (r *submitRequest) validate() string {
+	if strings.TrimSpace(r.Type) == "" {
+		return "type is required"
+	}
+
+	if r.Priority == "" {
+		r.Priority = store.PriorityNormal
+	}
+	if !r.Priority.Valid() {
+		return "priority must be one of: low, normal, high, critical"
+	}
+
+	if r.MaxAttempts == 0 {
+		r.MaxAttempts = defaultMaxAttempts
+	}
+	if r.MaxAttempts < 1 || r.MaxAttempts > maxAttemptsLimit {
+		return "max_attempts must be between 1 and 100"
+	}
+
+	if r.CallbackURL != "" {
+		u, err := url.Parse(r.CallbackURL)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return "callback_url must be an absolute http or https URL"
+		}
+	}
+
+	return ""
 }
 
 func (a *API) submit(w http.ResponseWriter, r *http.Request) {
@@ -55,32 +93,18 @@ func (a *API) submit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req submitRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid json body"))
 		return
 	}
-	if strings.TrimSpace(req.Type) == "" {
-		writeJSON(w, http.StatusBadRequest, errBody("type is required"))
+	if msg := req.validate(); msg != "" {
+		writeJSON(w, http.StatusBadRequest, errBody(msg))
 		return
 	}
 
-	// Idempotency: re-submitting the same key returns the original job rather
-	// than duplicating work. Networks retry; job execution should not.
-	if req.IdempotencyKey != "" {
-		if existing, ok := a.store.ByIdempotencyKey(req.IdempotencyKey); ok {
-			writeJSON(w, http.StatusOK, existing)
-			return
-		}
-	}
-
-	if req.Priority == "" {
-		req.Priority = store.PriorityNormal
-	}
-	if req.MaxAttempts <= 0 {
-		req.MaxAttempts = 5
-	}
-
-	j := &store.Job{
+	// Idempotency is resolved inside the store so the lookup and the insert
+	// are atomic. Networks retry; job execution should not.
+	stored, created, err := a.store.Create(&store.Job{
 		Type:           req.Type,
 		Payload:        req.Payload,
 		Priority:       req.Priority,
@@ -88,18 +112,22 @@ func (a *API) submit(w http.ResponseWriter, r *http.Request) {
 		MaxAttempts:    req.MaxAttempts,
 		CallbackURL:    req.CallbackURL,
 		IdempotencyKey: req.IdempotencyKey,
-		ScheduledAt:    req.ScheduleAt,
-	}
-	if err := a.store.Create(j); err != nil {
+		ScheduledAt:    req.ScheduledAt,
+	})
+	if err != nil {
 		a.log.Error("create job failed", "err", err)
 		writeJSON(w, http.StatusInternalServerError, errBody("could not create job"))
 		return
 	}
+	if !created {
+		writeJSON(w, http.StatusOK, stored)
+		return
+	}
 
 	// TODO(v1): enqueue onto RabbitMQ here (priority queue + DLX).
-	a.log.Info("job queued", "id", j.ID, "type", j.Type, "priority", j.Priority)
+	a.log.Info("job queued", "id", stored.ID, "type", stored.Type, "priority", stored.Priority)
 
-	writeJSON(w, http.StatusAccepted, j)
+	writeJSON(w, http.StatusAccepted, stored)
 }
 
 func (a *API) get(w http.ResponseWriter, r *http.Request) {
@@ -116,12 +144,13 @@ func (a *API) get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) authorized(r *http.Request) bool {
+	const prefix = "bearer "
 	h := r.Header.Get("Authorization")
-	if !strings.HasPrefix(strings.ToLower(h), "bearer ") {
+	if len(h) < len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
 		return false
 	}
 	return a.serviceSecret != "" &&
-		subtle.ConstantTimeCompare([]byte(h[7:]), []byte(a.serviceSecret)) == 1
+		subtle.ConstantTimeCompare([]byte(h[len(prefix):]), []byte(a.serviceSecret)) == 1
 }
 
 func errBody(msg string) map[string]string { return map[string]string{"error": msg} }
